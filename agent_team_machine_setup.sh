@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ------------------------------------------------------------------ defaults --
-ROLE="" ; NAME="" ; NUMBER=""
+ROLE="" ; NAME="" ; NUMBER="" ; SIGNER=""
 LOGIN_USER="$(whoami)"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 KEYS_FILE="$SELF_DIR/authorized_clients"          # shared PUBLIC-key allow-list (in repo)
@@ -53,6 +53,7 @@ Runs an interactive wizard by default. Flags below skip the questions.
   --name <Name>        (node) display name, e.g. Liger
   --number <N>         (node) machine number, e.g. 3
   --user <user>        login/SSH user to allow         (default: $LOGIN_USER)
+  --sign <name>        sign the registration commit, e.g. --sign "Amy Hua"
   --login-server <url> use a self-hosted Headscale instead of Tailscale's cloud
   --keys-file <path>   shared allow-list                (default: $KEYS_FILE)
   --cluster-file <path> shared manifest                 (default: $CLUSTER_FILE)
@@ -73,6 +74,7 @@ while [ $# -gt 0 ]; do
     --name)          NAME="$2"; shift 2;;
     --number)        NUMBER="$2"; shift 2;;
     --user)          LOGIN_USER="$2"; shift 2;;
+    --sign)          SIGNER="$2"; shift 2;;
     --login-server)  LOGIN_SERVER="$2"; shift 2;;
     --keys-file)     KEYS_FILE="$2"; shift 2;;
     --cluster-file)  CLUSTER_FILE="$2"; shift 2;;
@@ -158,7 +160,15 @@ allowlist_put() {
 # --- git / GitHub -----------------------------------------------------------
 git_in_repo() { git -C "$SELF_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; }
 git_has_origin() { git -C "$SELF_DIR" remote get-url origin >/dev/null 2>&1; }
-gh_authed() { ssh -o BatchMode=yes -o ConnectTimeout=8 -T git@github.com 2>&1 | grep -qi "successfully authenticated"; }
+GH_LAST=""
+# StrictHostKeyChecking=accept-new auto-pins GitHub's host key (so an unknown host
+# key can't make this fail under BatchMode). GH_LAST keeps the real output for
+# diagnostics — the failure is usually "Host key verification failed" or
+# "Permission denied (publickey)", and we must show which.
+gh_authed() {
+  GH_LAST="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -T git@github.com 2>&1)"
+  echo "$GH_LAST" | grep -qi "successfully authenticated"
+}
 ensure_github_access() {
   echo; echo "==> GitHub access (so this machine can sync the shared cluster state)"
   [ $DRY_RUN -eq 1 ] && { echo "  + (dry-run) would ensure a GitHub SSH key and verify auth"; return 0; }
@@ -175,18 +185,28 @@ ensure_github_access() {
   ssh-add --apple-use-keychain "$GH_KEY" >/dev/null 2>&1 || ssh-add "$GH_KEY" >/dev/null 2>&1 || true
   grep -q "github.com ssh-ed25519" "$HOME/.ssh/known_hosts" 2>/dev/null || \
     ssh-keyscan -t ed25519 github.com 2>/dev/null >> "$HOME/.ssh/known_hosts" || true
-  if gh_authed; then echo "  ✓ $(ssh -T git@github.com 2>&1 | head -1)"; return 0; fi
+  if gh_authed; then echo "  ✓ ${GH_LAST%%,*}"; return 0; fi
   if [ "$INTERACTIVE" != "1" ]; then
     echo "  ! Not authenticated to GitHub and running non-interactively — git sync disabled." >&2
+    echo "    (github said: ${GH_LAST:-no response})" >&2
     GIT_SYNC=0; return 0
   fi
   command -v pbcopy >/dev/null 2>&1 && pbcopy < "$GH_KEY.pub" && echo "  (public key copied to your clipboard)"
   while true; do
-    echo "  This machine's GitHub public key:"; echo "    $(cat "$GH_KEY.pub")"
-    echo "  Add it as an *Authentication key* at:  https://github.com/settings/ssh/new"
+    echo "  Add THIS machine's GitHub public key as an *Authentication key* at:"
+    echo "    https://github.com/settings/ssh/new"
+    echo "    key   : $(cat "$GH_KEY.pub")"
+    echo "    (matches fingerprint $(ssh-keygen -lf "$GH_KEY.pub" 2>/dev/null | awk '{print $2}'))"
     pause "Paste the key on GitHub (it's in your clipboard) and save it."
     if gh_authed; then echo "  ✓ GitHub authentication confirmed."; return 0; fi
-    askyn "  Still not authenticated — try again?" "y" || { echo "  Continuing without git sync."; GIT_SYNC=0; return 0; }
+    echo "  ✗ Still not authenticated. GitHub/SSH replied:"
+    echo "$GH_LAST" | sed 's/^/      /'
+    case "$GH_LAST" in
+      *"Permission denied"*) echo "      → the key isn't on the account you're pushing to. Make sure you pasted"
+                             echo "        the key above (not another), as an Authentication key, on the right account.";;
+      *"Host key verification"*) echo "      → host-key issue; re-run, it now auto-pins GitHub's host key.";;
+    esac
+    askyn "  Try again?" "y" || { echo "  Continuing without git sync (push manually later)."; GIT_SYNC=0; return 0; }
   done
 }
 git_pull_latest() {
@@ -203,9 +223,27 @@ git_register_push() {
   echo; echo "==> Registering this machine in the repo (commit + push shared state)"
   git -C "$SELF_DIR" add authorized_clients cluster.conf >/dev/null 2>&1 || true
   if git -C "$SELF_DIR" diff --cached --quiet 2>/dev/null; then echo "    Nothing new to register."; return 0; fi
-  git -C "$SELF_DIR" commit -q -m "register $ROLE: $NAME${NUMBER:+ #$NUMBER} ($LOCAL)" || true
+
+  # Show exactly what would be registered, then ask before committing/pushing.
+  echo "    Changes to register:"
+  git -C "$SELF_DIR" diff --cached --stat 2>/dev/null | sed 's/^/      /'
+  if [ "$INTERACTIVE" = "1" ]; then
+    if ! askyn "  Commit and push these to GitHub now?" "y"; then
+      echo "    Skipped (changes left staged). Push later with:"
+      echo "      git -C '$SELF_DIR' commit -m 'register' && git -C '$SELF_DIR' push"
+      return 0
+    fi
+    # Offer to sign the commit (defaults to your git name; blank = unsigned).
+    [ -n "$SIGNER" ] || SIGNER="$(ask "  Sign this commit as (blank to skip)" "$(git -C "$SELF_DIR" config user.name 2>/dev/null)")"
+  fi
+
+  local msg="register $ROLE: $NAME${NUMBER:+ #$NUMBER} ($LOCAL)"
+  [ -n "$SIGNER" ] && msg="$msg
+
+Signed by $SIGNER"
+  git -C "$SELF_DIR" commit -q -m "$msg" || true
   git -C "$SELF_DIR" pull --rebase --autostash -q 2>/dev/null || true
-  if git -C "$SELF_DIR" push -q 2>/dev/null; then echo "    ✓ Pushed registration to origin."
+  if git -C "$SELF_DIR" push -q 2>/dev/null; then echo "    ✓ Pushed registration to origin${SIGNER:+ (signed by $SIGNER)}."
   else echo "    ! Push failed — resolve and run: git -C '$SELF_DIR' push"; fi
 }
 
@@ -512,8 +550,8 @@ if [ "$ROLE" = "node" ]; then
   echo "  Cluster now contains:"
   [ -s "$CLUSTER_FILE" ] && awk -F'|' '{printf "     #%s  %-10s %s\n",$1,$2,$3}' "$CLUSTER_FILE"
   echo
-  echo "  NEXT: commit & push the updated authorized_clients + cluster.conf, then"
-  echo "        'git pull' on the next mini and run this again."
+  echo "  NEXT: 'git pull' on the next mini and run this again"
+  echo "        (this machine's registration was already pushed above)."
 else
   echo "  DONE: this MASTER can now reach the cluster. Try:  ssh <name>"
   echo "  Known machines:"
