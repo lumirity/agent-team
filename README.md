@@ -2,93 +2,149 @@
 
 Tooling to stand up and run an **always-on cluster of Mac minis** that host
 long-running [Claude Code](https://claude.com/claude-code) sessions, reachable
-securely from one machine you carry — the **MASTER**.
+securely from one machine you control — the **MASTER**.
 
-Clone the repo onto a fresh Mac mini, run one script, answer a few prompts, and
-the machine becomes a hardened, always-on node you can `ssh` into from anywhere.
+Clone the repo onto a machine, run one script, answer a few prompts, and the
+machine joins the cluster — hardened, always-on, and registered for everyone else
+to see.
 
 ```bash
 git clone git@github.com:lumirity/agent-team.git
 cd agent-team
-./agent_team_machine_setup.sh          # interactive wizard
+./agent_team_machine_setup.sh            # interactive wizard
 ```
 
 ---
 
-## The model
+## How this repo works (the shared registry)
+
+**This repo registers the machines in the cluster and holds the shared state that
+all nodes and the master need to reach and trust each other.** It is the cluster's
+single source of truth — and it stores **only non-secret data**:
+
+| File | Shared state it holds |
+|------|-----------------------|
+| `authorized_clients` | The **public-key allow-list** — every key permitted to SSH into any node (the master's access key + each node's identity key). Public keys can't authenticate on their own, so this is not secret. |
+| `cluster.conf` | The **machine manifest** — one line per machine (`NUMBER\|NAME\|LOCAL\|date`), i.e. the roster. |
+| `agent_team_machine_setup.sh`, `.gitignore`, `README.md` | The tooling and docs. |
+
+Every time you run the setup script on a machine, it:
+
+1. **pulls** the latest `authorized_clients` + `cluster.conf` from the repo,
+2. **registers** this machine — adds its key to the allow-list and (for nodes)
+   its entry to the manifest, and
+3. **pushes** the updated state back.
+
+So the repo is how machines converge on a single, consistent allow-list and
+roster without you copying keys around by hand. **Private keys never enter the
+repo** — they live outside it (see *Where private keys live* below), and
+`.gitignore` is a backstop.
+
+> 🔒 **Keep the GitHub repo private.** It holds no secrets, but it maps your
+> infrastructure. Private repo + your GitHub SSH key + 2FA.
+
+---
+
+## The security model
 
 You SSH **from** the MASTER **into** the NODEs. A machine can connect only when
-**all three** of these are true — defense in depth, so losing any one is not enough:
+**all three** are true — lose any one and access fails:
 
 | # | Condition | Enforced by |
 |---|-----------|-------------|
-| 1 | It's in your private **Tailscale** network (tailnet) | WireGuard device authorization — only devices you approve can even reach a node |
-| 2 | It holds the cluster's **authorized SSH key** | Key-only OpenSSH; the wizard creates & installs the key for you |
+| 1 | It's in your private **Tailscale** network | WireGuard device authorization — only devices you approve can even reach a node |
+| 2 | It holds the cluster's **authorized SSH key** | Key-only OpenSSH; keys are created & installed for you |
 | 3 | It logs in as your **user account** (`amy`) | `AllowUsers` + macOS SSH access group |
 
-On top of that: persistent work uses **tmux** (sessions survive disconnects) and
-resilient links use **autossh** (auto-reconnect). See `../SSH_SETUP.md` for the
-full connection guide.
-
-```
-   MASTER  ──WireGuard (Tailscale)──►  NODE: nora-2, liger-3, ...
-   (you SSH from)                       (always-on, key-only sshd, tmux + claude)
-```
+Persistent work runs in **tmux** (survives disconnects); resilient links use
+**autossh** (auto-reconnect). Full connection guide: `../SSH_SETUP.md`.
 
 ---
 
-## What's in this repo — and what is NOT
+## What this adds beyond Tailscale
 
-**In the repo (all non-secret, safe to push):**
+Tailscale already gives you condition **(1)** — the encrypted network — and, if
+you enable **Tailscale SSH** (`tailscale up --ssh`), it can also broker **(2)**
+and **(3)** using your tailnet identity, with *no SSH keys or `authorized_keys`
+at all*. So if all you want is *to connect*, `tailscale up --ssh` on each mini is
+nearly enough.
 
-| File | Purpose |
-|------|---------|
-| `agent_team_machine_setup.sh` | The interactive installer (node + master roles) |
-| `authorized_clients` | Shared allow-list of **public** keys (public keys can't authenticate by themselves) |
-| `cluster.conf` | Manifest of machines (`NUMBER\|NAME\|LOCAL\|date`) |
-| `.gitignore` | Blocks private keys from ever being committed |
-| `README.md` | This file |
+What this repo adds on top of Tailscale:
 
-**NEVER in the repo (private keys):**
+| | Tailscale alone | This repo adds |
+|---|---|---|
+| Encrypted reachability | ✅ | — |
+| SSH auth | ✅ with Tailscale SSH | key-only OpenSSH as a defense-in-depth alternative |
+| **Always-on host tuning** (no-sleep, auto-restart, firewall, hostname) | ❌ | ✅ |
+| **tmux + autossh** for persistent long-running sessions | ❌ | ✅ |
+| **`ssh <name>` shortcuts** | partial (MagicDNS names) | ✅ |
+| **Shared roster + git registry** of machines/keys | ❌ | ✅ |
 
-- The cluster **access private key** and any node private keys.
-- They live **outside** the repo in `~/.config/agent-team/keys/` (override with
-  `$AGENT_TEAM_SECRETS` or `--secrets-dir`), plus the usual `~/.ssh/`.
-- `.gitignore` blocks `keys/`, `*_ed25519`, `*.pem`, `*.key`, etc. as a backstop.
-
-> 🔒 **Make the GitHub repo private.** Even though it holds no secrets, it
-> describes your infrastructure. Private repo + your own GitHub SSH key + 2FA.
+In short: the durable value here is the **always-on Claude Code host setup,
+persistent-session tooling, and the cluster roster/shortcuts** — plus key-only
+SSH for anyone who doesn't want to trust Tailscale's control plane for auth. If
+you'd rather lean fully on Tailscale for auth, run with `--no-tailscale` off and
+use Tailscale SSH; the SSH-key machinery then becomes optional.
 
 ---
 
-## Where private keys are stored (and how to keep them safe)
+## What the setup script does
+
+Run `./agent_team_machine_setup.sh` (wizard) or pass flags. In order, it:
+
+1. **Installs packages** — `git`, `autossh`, `tmux`, `mosh` (+ `tailscale`).
+2. **Sets up GitHub access for this machine** — generates a dedicated SSH key,
+   configures `~/.ssh/config`, pins GitHub's host key, then **pauses and waits**
+   for you to add the key at <https://github.com/settings/ssh/new> (the public
+   key is copied to your clipboard). It re-checks until auth succeeds — needed so
+   the machine can sync the shared state.
+3. **Pulls** the latest shared state from the repo.
+4. **Sets up the machine for its role** (you choose **node** or **master**):
+   - **node** — names it `<name>-<number>`, enables **key-only hardened SSH**,
+     applies **always-on power + firewall** tuning, generates this node's
+     identity key, installs the allow-list into `~/.ssh/authorized_keys`, writes
+     a tmux config, and records itself in `cluster.conf`.
+   - **master** — creates (or reuses) the **cluster access key**, then **pauses
+     and requires you to back it up** (local copy **and** password manager /
+     encrypted USB) before continuing, installs it locally, and writes
+     `ssh <name>` shortcuts for every machine.
+5. **Joins Tailscale** (or a self-hosted Headscale via `--login-server`).
+6. **Self-heals keys** — if an SSH key was deleted or corrupted, it's backed up,
+   regenerated, and its stale allow-list entry is replaced with the new one.
+7. **Commits & pushes** the updated `authorized_clients` + `cluster.conf` so the
+   rest of the cluster sees this machine.
+
+It is **idempotent** — safe to re-run anytime (e.g. to recover a lost key or
+refresh shortcuts).
+
+---
+
+## Where private keys live (and how to keep them safe)
 
 | Key | Lives on | Path | In repo? | Backup |
 |-----|----------|------|:--------:|--------|
-| **Cluster access key** (the master's identity) | the MASTER | `~/.config/agent-team/keys/agentteam_access_ed25519`, installed to `~/.ssh/agentteam_access_ed25519` | ❌ never | Password manager (1Password/Bitwarden) **or** encrypted USB |
-| **Node identity key** (mini↔mini mesh) | each NODE | `~/.ssh/id_ed25519` | ❌ never | Not needed — regenerable per node |
-| **Public** halves of the above | everywhere | `authorized_clients` (repo) + each node's `~/.ssh/authorized_keys` | ✅ yes | git |
+| **Cluster access key** (the master's credential) | the MASTER | `~/.config/agent-team/keys/agentteam_access_ed25519`, installed to `~/.ssh/` | ❌ never | **Password manager / encrypted USB** (the script makes you do this) |
+| **Node identity key** (mini↔mini) | each NODE | `~/.ssh/id_ed25519` | ❌ never | Not needed — regenerable (self-healing) |
+| **GitHub key** (per machine) | each machine | `~/.ssh/github_ed25519` | ❌ never | Not needed — regenerable, re-add to GitHub |
+| **Public** halves | everywhere | `authorized_clients` (repo) + nodes' `authorized_keys` | ✅ yes | git |
 
-Guidance:
+- The **access private key is the master credential.** Anyone holding it can
+  reach the cluster. The script pauses so you store it in a password manager
+  *and* keep the local copy on a FileVault-encrypted disk. Lose it → re-key the
+  cluster; leak it → revoke (below).
+- **Nodes never hold a private *client* key** — only public keys — so a stolen
+  node can't log into the others.
+- Want it un-exfiltratable? Generate the access key in the Secure Enclave (e.g.
+  the [Secretive](https://github.com/maxgoedjen/secretive) app) or on a hardware
+  key (`ssh-keygen -t ed25519-sk`); add only its public key to `authorized_clients`.
 
-- **The access private key is your master credential.** Anyone who has it can
-  reach the cluster. Treat it like a password: store the canonical copy in a
-  password manager or on an encrypted USB; let it exist only on the MASTER's
-  encrypted disk (keep **FileVault on**).
-- **Nodes never hold a private *client* key** — only public keys. So a stolen
-  node cannot be used to log into the other nodes' accounts.
-- **Want it un-exfiltratable?** Generate the access key in the Secure Enclave
-  (e.g. the [Secretive](https://github.com/maxgoedjen/secretive) app, or a
-  hardware security key with `ssh-keygen -t ed25519-sk`) so the private key can
-  never leave the machine. Then add only its public key to `authorized_clients`.
-- **Rotate / revoke** by deleting the key, removing its line from
-  `authorized_clients`, committing, and re-running the installer on each node.
+Override the secrets location with `--secrets-dir <path>` or `$AGENT_TEAM_SECRETS`.
 
 ---
 
 ## Setup
 
-### 0. One-time: publish the repo (do this once, from the first machine)
+### 0. One-time: publish the repo (from the first machine)
 
 ```bash
 cd ~/agent-team
@@ -100,28 +156,18 @@ git remote add origin git@github.com:lumirity/agent-team.git
 git push -u origin main
 ```
 
-### 1. Set up the MASTER (the machine you SSH from)
+### 1. The MASTER (the machine you SSH from)
 
 ```bash
 git clone git@github.com:lumirity/agent-team.git && cd agent-team
 ./agent_team_machine_setup.sh --role master
 ```
 
-This joins the tailnet, **creates the cluster access key** (if it doesn't exist),
-installs it into your `~/.ssh`, adds its public key to `authorized_clients`, and
-writes `ssh <name>` shortcuts. Then publish the updated public allow-list:
+Follow the prompts: add the machine's GitHub key when asked, then **back up the
+cluster access key** when it pauses. It installs the key locally, writes your
+`ssh <name>` shortcuts, and pushes the allow-list automatically.
 
-```bash
-git add authorized_clients cluster.conf && git commit -m "enroll master" && git push
-```
-
-> Back up `~/.config/agent-team/keys/agentteam_access_ed25519` to your password
-> manager now. On a **second** master later, restore that file to the same path
-> *before* running, and the wizard will reuse it instead of minting a new one.
-
-### 2. Set up each NODE (a Mac mini)
-
-On the fresh mini:
+### 2. Each NODE (a Mac mini)
 
 ```bash
 git clone git@github.com:lumirity/agent-team.git && cd agent-team
@@ -129,16 +175,9 @@ git clone git@github.com:lumirity/agent-team.git && cd agent-team
 # (or just ./agent_team_machine_setup.sh and answer the prompts)
 ```
 
-The node installs the public `authorized_clients` (so it trusts the master),
-enables hardened key-only SSH, applies always-on power + firewall tuning, joins
-the tailnet, and registers itself in `cluster.conf`. Then share the update:
-
-```bash
-git add authorized_clients cluster.conf && git commit -m "add Liger #3" && git push
-```
-
-Approve the new device in the Tailscale admin console. Re-run on existing nodes
-(after `git pull`) to refresh their peer shortcuts.
+It pulls the latest allow-list, hardens the machine, joins the tailnet, registers
+itself, and pushes. Approve the new device in the Tailscale admin console. Set up
+the **master first**, so its access key is already in the allow-list nodes pull.
 
 ---
 
@@ -147,7 +186,7 @@ Approve the new device in the Tailscale admin console. Re-run on existing nodes
 From the MASTER (or any node):
 
 ```bash
-ssh nora            # shortcuts were written into ~/.ssh/config for every machine
+ssh nora            # shortcuts are written into ~/.ssh/config for every machine
 ssh liger
 ```
 
@@ -157,33 +196,34 @@ Resilient + persistent Claude Code (add to `~/.zshrc` on the MASTER):
 alias nora='autossh -M 0 -t nora "tmux new -A -s claude"'
 ```
 
-`autossh` keeps the link alive across Wi-Fi drops; `tmux new -A -s claude` always
-drops you into the same persistent session. Detach with `Ctrl-b d` (Claude keeps
-running on the node); reattach later with the same command. Full details and
+`autossh` keeps the link alive; `tmux new -A -s claude` always reattaches the same
+session. Detach with `Ctrl-b d` (Claude keeps running on the node). Details and
 troubleshooting: `../SSH_SETUP.md`.
 
 ---
 
-## Secure-setup checklist
+## Recovering a lost or corrupted key
 
-- [ ] GitHub repo is **private**; pushed over SSH (`git@`), GitHub 2FA on.
-- [ ] `git status` never shows `*_ed25519` / `keys/` — `.gitignore` covers them.
-- [ ] Access private key backed up to a password manager / encrypted USB.
-- [ ] **FileVault on** for every machine (it is, on Nora).
-- [ ] Tailscale: **disable key expiry** for always-on nodes; consider **tailnet
-      lock** and an **ACL** limiting who reaches port 22.
-- [ ] Nodes expose **no** SSH to the public internet (only via the tailnet);
-      app firewall + stealth mode are enabled by the installer.
+Just re-run the script on that machine:
+
+```bash
+./agent_team_machine_setup.sh --role node --name Liger --number 3
+```
+
+If `~/.ssh/id_ed25519` (node) or the access key (master) is missing or unreadable,
+it's backed up (`*.corrupt.<timestamp>`), regenerated, the **stale allow-list
+entry is replaced**, and the change is pushed — so peers trust the new key. (A
+master whose access key is truly gone with no backup must re-key: a fresh key is
+minted and pushed; re-run nodes to pick it up.)
 
 ## Revoking access
 
-1. Delete the offending key from `~/.config/agent-team/keys/` (and the master's `~/.ssh`).
-2. Remove its line from `authorized_clients`; `git commit && git push`.
-3. `git pull` + re-run the installer on each node (rewrites `authorized_keys`).
-4. Delete the device in the Tailscale admin console.
+1. Remove the key's line from `authorized_clients`; `git commit && git push`.
+2. `git pull` + re-run the installer on each node (rewrites `authorized_keys`).
+3. Delete the device in the Tailscale admin console.
 
-(Removing the device from Tailscale alone already blocks network reach; do both
-for full revocation.)
+(Removing the Tailscale device alone already blocks network reach; do both for
+full revocation.)
 
 ---
 

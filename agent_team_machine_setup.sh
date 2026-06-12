@@ -13,10 +13,15 @@
 #     ./agent_team_machine_setup.sh --role node   --name Liger --number 3
 #     ./agent_team_machine_setup.sh --role master
 #
-# Distribution: clone the repo, run the script. The repo carries only NON-secret
-# material (script, PUBLIC allow-list, manifest). PRIVATE keys live OUTSIDE the
-# repo in $AGENT_TEAM_SECRETS (default ~/.config/agent-team) and are NEVER pushed.
+# Distribution: clone the repo, run the script. The repo is the cluster's shared
+# REGISTRY — it carries only NON-secret state (script, PUBLIC allow-list, machine
+# manifest). Each run installs git + sets up this machine's GitHub key (pausing
+# for you to add it), PULLS the latest shared state, configures the machine, then
+# COMMITS+PUSHES its registration so every node/master converges on one roster.
+# PRIVATE keys live OUTSIDE the repo in $AGENT_TEAM_SECRETS (default
+# ~/.config/agent-team) and are NEVER pushed.
 #
+# Self-healing: deleted/corrupted SSH keys are regenerated and re-registered.
 # Idempotent. Privileged steps use sudo (you are prompted once).
 set -euo pipefail
 
@@ -90,6 +95,8 @@ ACCESS_PRIV="$KEYS_DIR/agentteam_access_ed25519"
 ACCESS_PUB="$ACCESS_PRIV.pub"
 # Accept friendly aliases for the master role.
 case "$ROLE" in client|portable|p) ROLE="master";; esac
+GH_KEY="$HOME/.ssh/github_ed25519"                 # this machine's GitHub key
+GIT_SYNC=1                                          # pull/push shared state via git
 
 # --------------------------------------------------------- helpers ------------
 run()  { echo "  + $*"; [ $DRY_RUN -eq 1 ] || eval "$@"; }
@@ -104,6 +111,103 @@ ask() {
   echo "${ans:-$def}"
 }
 askyn() { local a; a="$(ask "$1 (y/n)" "${2:-y}")"; case "$a" in y*|Y*) return 0;; *) return 1;; esac; }
+# pause <msg>: in interactive mode, wait for ENTER; otherwise just print and go.
+pause() {
+  if [ "$INTERACTIVE" = "1" ] && [ $DRY_RUN -eq 0 ]; then
+    printf "\n  %s\n  >> Press ENTER to continue once done... " "$1" >&2; IFS= read -r _ || true
+  elif [ -n "${1:-}" ]; then echo "  ($1)"; fi
+}
+
+# --- key self-healing -------------------------------------------------------
+# valid_key <priv>: true only if it's a readable private key we can derive a pub from.
+valid_key() { [ -f "$1" ] && ssh-keygen -y -f "$1" >/dev/null 2>&1; }
+# ensure_keypair <priv> <comment>: create if missing OR corrupt (deleted/garbled
+# keys are backed up and regenerated); always (re)writes a matching .pub carrying
+# <comment>. Echoes "new" if it generated one, "ok" if it reused a good one.
+ensure_keypair() {
+  local priv="$1" comment="$2" body
+  [ $DRY_RUN -eq 1 ] && { echo ok; return 0; }
+  mkdir -p "$(dirname "$priv")"
+  if valid_key "$priv"; then
+    body="$(ssh-keygen -y -f "$priv" 2>/dev/null)"; echo "$body $comment" > "$priv.pub"
+    chmod 600 "$priv"; chmod 644 "$priv.pub"; echo ok; return 0
+  fi
+  if [ -e "$priv" ]; then
+    local bak="$priv.corrupt.$(date +%s)"; mv "$priv" "$bak" 2>/dev/null || true
+    echo "    ! $priv was missing/unreadable — backed up to $(basename "$bak"), regenerating." >&2
+  fi
+  rm -f "$priv.pub"
+  ssh-keygen -t ed25519 -a 100 -N '' -C "$comment" -f "$priv" >/dev/null
+  chmod 600 "$priv"; chmod 644 "$priv.pub"; echo new
+}
+# allowlist_put <pubfile> <comment_regex>: drop any existing allow-list line whose
+# comment matches the regex (so a rotated/regenerated key replaces its old entry),
+# then append the new pub and de-dupe by key body. Keeps comment lines intact.
+allowlist_put() {
+  local pub="$1" cre="$2" tmp
+  [ $DRY_RUN -eq 1 ] && return 0
+  touch "$KEYS_FILE"; tmp="$(mktemp)"
+  awk -v re="$cre" '
+    /^[[:space:]]*#/ {print; next} NF<2 {print; next}
+    { c=""; for(i=3;i<=NF;i++) c=c (i>3?" ":"") $i; if (c ~ re) next; print }' "$KEYS_FILE" > "$tmp"
+  cat "$pub" >> "$tmp"
+  awk '{ if ($1 ~ /^#/ || NF<2) {print; next} if (!seen[$2]++) print }' "$tmp" > "$KEYS_FILE"
+  rm -f "$tmp"
+}
+
+# --- git / GitHub -----------------------------------------------------------
+git_in_repo() { git -C "$SELF_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; }
+git_has_origin() { git -C "$SELF_DIR" remote get-url origin >/dev/null 2>&1; }
+gh_authed() { ssh -o BatchMode=yes -o ConnectTimeout=8 -T git@github.com 2>&1 | grep -qi "successfully authenticated"; }
+ensure_github_access() {
+  echo; echo "==> GitHub access (so this machine can sync the shared cluster state)"
+  [ $DRY_RUN -eq 1 ] && { echo "  + (dry-run) would ensure a GitHub SSH key and verify auth"; return 0; }
+  # commit identity
+  if [ -z "$(git config --global user.email 2>/dev/null)" ] && [ "$INTERACTIVE" = "1" ]; then
+    git config --global user.name  "$(ask 'Git commit name' "$(scutil --get ComputerName 2>/dev/null || echo)")"
+    git config --global user.email "$(ask 'Git commit email' "")"
+  fi
+  ensure_keypair "$GH_KEY" "github-$LOCAL" >/dev/null
+  if ! grep -q "^Host github.com$" "$SSH_CFG" 2>/dev/null; then
+    touch "$SSH_CFG"; chmod 600 "$SSH_CFG"
+    printf '\nHost github.com\n    HostName github.com\n    User git\n    AddKeysToAgent yes\n    UseKeychain yes\n    IdentityFile %s\n    IdentitiesOnly yes\n' "$GH_KEY" >> "$SSH_CFG"
+  fi
+  ssh-add --apple-use-keychain "$GH_KEY" >/dev/null 2>&1 || ssh-add "$GH_KEY" >/dev/null 2>&1 || true
+  grep -q "github.com ssh-ed25519" "$HOME/.ssh/known_hosts" 2>/dev/null || \
+    ssh-keyscan -t ed25519 github.com 2>/dev/null >> "$HOME/.ssh/known_hosts" || true
+  if gh_authed; then echo "  ✓ $(ssh -T git@github.com 2>&1 | head -1)"; return 0; fi
+  if [ "$INTERACTIVE" != "1" ]; then
+    echo "  ! Not authenticated to GitHub and running non-interactively — git sync disabled." >&2
+    GIT_SYNC=0; return 0
+  fi
+  command -v pbcopy >/dev/null 2>&1 && pbcopy < "$GH_KEY.pub" && echo "  (public key copied to your clipboard)"
+  while true; do
+    echo "  This machine's GitHub public key:"; echo "    $(cat "$GH_KEY.pub")"
+    echo "  Add it as an *Authentication key* at:  https://github.com/settings/ssh/new"
+    pause "Paste the key on GitHub (it's in your clipboard) and save it."
+    if gh_authed; then echo "  ✓ GitHub authentication confirmed."; return 0; fi
+    askyn "  Still not authenticated — try again?" "y" || { echo "  Continuing without git sync."; GIT_SYNC=0; return 0; }
+  done
+}
+git_pull_latest() {
+  [ $DRY_RUN -eq 1 ] && return 0
+  [ "$GIT_SYNC" = 1 ] || return 0
+  git_in_repo && git_has_origin || return 0
+  echo; echo "==> Pulling latest shared cluster state (authorized_clients, cluster.conf)"
+  git -C "$SELF_DIR" pull --rebase --autostash 2>&1 | sed 's/^/    /' || echo "    (pull skipped — continuing)"
+}
+git_register_push() {
+  [ $DRY_RUN -eq 1 ] && return 0
+  if [ "$GIT_SYNC" != 1 ]; then echo "  (git sync off — commit & push authorized_clients/cluster.conf yourself)"; return 0; fi
+  git_in_repo && git_has_origin || { echo "  (not a git checkout with an origin — skipping push)"; return 0; }
+  echo; echo "==> Registering this machine in the repo (commit + push shared state)"
+  git -C "$SELF_DIR" add authorized_clients cluster.conf >/dev/null 2>&1 || true
+  if git -C "$SELF_DIR" diff --cached --quiet 2>/dev/null; then echo "    Nothing new to register."; return 0; fi
+  git -C "$SELF_DIR" commit -q -m "register $ROLE: $NAME${NUMBER:+ #$NUMBER} ($LOCAL)" || true
+  git -C "$SELF_DIR" pull --rebase --autostash -q 2>/dev/null || true
+  if git -C "$SELF_DIR" push -q 2>/dev/null; then echo "    ✓ Pushed registration to origin."
+  else echo "    ! Push failed — resolve and run: git -C '$SELF_DIR' push"; fi
+}
 
 # Decide whether to run the wizard
 if [ "$INTERACTIVE" = "auto" ]; then
@@ -172,32 +276,55 @@ NEED_SUDO=0; { [ "$ROLE" = "node" ] || [ $DO_TAILSCALE -eq 1 ]; } && NEED_SUDO=1
 [ $DRY_RUN -eq 1 ] || [ $NEED_SUDO -eq 0 ] || sudo -v
 
 # ---------------------------------------------- 1. packages -------------------
-echo; echo "==> Packages (autossh, tmux, mosh$([ $DO_TAILSCALE -eq 1 ] && echo ', tailscale'))"
+echo; echo "==> Packages (git, autossh, tmux, mosh$([ $DO_TAILSCALE -eq 1 ] && echo ', tailscale'))"
 if command -v brew >/dev/null 2>&1; then
-  PKGS="autossh tmux mosh"; [ $DO_TAILSCALE -eq 1 ] && PKGS="$PKGS tailscale"
+  PKGS="git autossh tmux mosh"; [ $DO_TAILSCALE -eq 1 ] && PKGS="$PKGS tailscale"
   run "brew install $PKGS || true"
 else
   echo "  ! Homebrew not found — install from https://brew.sh first." >&2
   [ $FORCE -eq 1 ] || exit 1
 fi
+# macOS ships git via the Command Line Tools; make sure *something* git exists.
+command -v git >/dev/null 2>&1 || { [ $DRY_RUN -eq 1 ] || xcode-select --install 2>/dev/null || true; }
+
+# ------------- GitHub access + pull the latest shared state -------------------
+# This repo IS the cluster's shared registry: it must be able to pull the newest
+# authorized_clients/cluster.conf before we change them, and push our changes
+# back afterwards. So we set up (and verify) GitHub SSH access first.
+ensure_github_access
+git_pull_latest
 
 # --------------------- 2. THE managed cluster access key (condition 2) --------
-# Created once, stored in this control dir, reused everywhere. The user never
-# runs ssh-keygen or copies a key.
-echo; echo "==> Cluster access key (managed automatically)"
-run "mkdir -p '$KEYS_DIR'"; run "chmod 700 '$KEYS_DIR'"
-if [ ! -f "$ACCESS_PRIV" ]; then
+# The access key's PRIVATE half belongs ONLY on the MASTER. Nodes receive its
+# PUBLIC half via the repo's authorized_clients (pulled above). So we generate it
+# only during a master setup; it is created once and reused (self-healing).
+if [ "$ROLE" = "master" ]; then
+  echo; echo "==> Cluster access key (managed automatically; master-only)"
+  run "mkdir -p '$KEYS_DIR'"; run "chmod 700 '$KEYS_DIR'"
   TAG="$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z' | cut -c1-8 || echo $$)"
-  run "ssh-keygen -t ed25519 -a 100 -N '' -C 'agentteam-access-$TAG' -f '$ACCESS_PRIV'"
-  echo "    Created a unique cluster access key (agentteam-access-$TAG)."
-else
-  echo "    Reusing existing cluster access key."
-fi
-# Make sure its PUBLIC half is in the shared allow-list (so every node trusts it).
-if [ $DRY_RUN -eq 0 ] && [ -f "$ACCESS_PUB" ]; then
-  touch "$KEYS_FILE"
-  if ! awk '{print $2}' "$KEYS_FILE" | grep -qxF "$(awk '{print $2}' "$ACCESS_PUB")"; then
-    cat "$ACCESS_PUB" >> "$KEYS_FILE"; echo "    Added access key to the shared allow-list."
+  case "$(ensure_keypair "$ACCESS_PRIV" "agentteam-access-$TAG")" in
+    new) echo "    Created a new cluster access key.";;
+    ok)  echo "    Reusing existing cluster access key.";;
+  esac
+  # Put its PUBLIC half in the shared allow-list (replacing any prior access line).
+  [ $DRY_RUN -eq 0 ] && [ -f "$ACCESS_PUB" ] && allowlist_put "$ACCESS_PUB" "^agentteam-access"
+
+  # The access key IS the master credential — make the user secure it before we go on.
+  if [ $DRY_RUN -eq 0 ]; then
+    echo
+    echo "  ┌─ SECURE YOUR MASTER ACCESS KEY ───────────────────────────────────"
+    echo "  │ This private key is the master credential for the whole cluster."
+    echo "  │ Lose it and you must re-key every node; leak it and anyone can SSH in."
+    echo "  │ Private key : $ACCESS_PRIV"
+    echo "  │ Fingerprint : $(ssh-keygen -lf "$ACCESS_PUB" 2>/dev/null | awk '{print $2}')"
+    echo "  │ STORE IT NOW in BOTH places:"
+    echo "  │   1) keep this local copy (on your FileVault-encrypted disk), and"
+    echo "  │   2) save a copy in your password manager / encrypted USB."
+    echo "  └───────────────────────────────────────────────────────────────────"
+    if [ "$INTERACTIVE" = "1" ] && askyn "  Print the private key now so you can copy it into your password manager?" "n"; then
+      echo "  ----- BEGIN (copy everything between the lines) -----"; cat "$ACCESS_PRIV"; echo "  ----- END -----"
+    fi
+    pause "Back up the master access key in your password manager AND keep the local copy."
   fi
 fi
 
@@ -209,15 +336,14 @@ run "touch '$HOME/.ssh/authorized_keys'"; run "chmod 600 '$HOME/.ssh/authorized_
 # =============================================================== NODE ROLE ====
 if [ "$ROLE" = "node" ]; then
   # This node's own identity key, for SSH between minis (peer mesh).
+  # Self-healing: if the key was deleted or corrupted, it is regenerated and the
+  # stale allow-list entry is replaced with the fresh one.
   echo; echo "==> Node identity key (for peer SSH between minis)"
-  if [ ! -f "$NODE_KEY" ]; then
-    run "ssh-keygen -t ed25519 -a 100 -N '' -C '$LOCAL-node' -f '$NODE_KEY'"
-  else echo "    Reusing $NODE_KEY"; fi
-  if [ $DRY_RUN -eq 0 ] && [ -f "$NODE_KEY.pub" ]; then
-    if ! awk '{print $2}' "$KEYS_FILE" | grep -qxF "$(awk '{print $2}' "$NODE_KEY.pub")"; then
-      cat "$NODE_KEY.pub" >> "$KEYS_FILE"
-    fi
-  fi
+  case "$(ensure_keypair "$NODE_KEY" "$LOCAL-node")" in
+    new) echo "    Generated a fresh node identity key.";;
+    ok)  echo "    Reusing $NODE_KEY";;
+  esac
+  [ $DRY_RUN -eq 0 ] && [ -f "$NODE_KEY.pub" ] && allowlist_put "$NODE_KEY.pub" "^$LOCAL-node$"
 
   # Condition (2): install the shared allow-list into authorized_keys.
   echo; echo "==> Installing the authorized keys (condition 2)"
@@ -351,6 +477,9 @@ set -g status-style "bg=colour24,fg=white"
 bind r source-file ~/.tmux.conf \\; display "tmux.conf reloaded"
 TMUX
 fi
+
+# ----------------------- register shared state back to the repo --------------
+git_register_push
 
 # ------------------------------------------------ verification checklist ------
 echo; echo "==> Verifying the three conditions"
