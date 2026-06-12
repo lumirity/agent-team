@@ -558,9 +558,27 @@ else
   [ -s "$CLUSTER_FILE" ] && awk -F'|' '{printf "     #%s  %-10s -> ssh %s\n",$1,$2,tolower($2)}' "$CLUSTER_FILE"
 fi
 echo
-echo "  SECURITY: the PRIVATE access key lives in '$KEYS_DIR'"
-echo "  (outside the git repo — never committed). Back it up to your password"
-echo "  manager / encrypted USB. Anyone holding it can SSH to the cluster."
-echo "  To revoke: delete that key, remove its line from authorized_clients,"
-echo "  commit & push, then re-run this on each node."
+# The PRIVATE access key exists ONLY on the master (it is generated during a
+# master run into $KEYS_DIR). A node never holds it — it only installs the
+# PUBLIC half from authorized_clients. So describe the right thing per role,
+# and never claim a path that isn't actually there.
+if [ "$ROLE" = "master" ]; then
+  if [ -f "$ACCESS_PRIV" ]; then
+    echo "  SECURITY: the PRIVATE access key lives in '$KEYS_DIR'"
+    echo "    -> $ACCESS_PRIV"
+    echo "  (outside the git repo — never committed). Back it up to your password"
+    echo "  manager / encrypted USB. Anyone holding it can SSH to the cluster."
+    echo "  To revoke: delete that key, remove its line from authorized_clients,"
+    echo "  commit & push, then re-run this on each node."
+  else
+    echo "  SECURITY: no private access key was created at '$ACCESS_PRIV'."
+    echo "  (Expected for a dry-run; otherwise re-run the master setup to generate it.)"
+  fi
+else
+  echo "  SECURITY: this NODE does not hold the private access key — by design."
+  echo "  It only installs the PUBLIC half (from authorized_clients) into"
+  echo "  ~/.ssh/authorized_keys. The private key lives ONLY on the MASTER, in"
+  echo "  its '$KEYS_DIR'. Run '--role master' on the machine you SSH FROM to"
+  echo "  create it; back THAT copy up to your password manager / encrypted USB."
+fi
 echo "============================================================"
