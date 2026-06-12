@@ -1,0 +1,399 @@
+#!/bin/bash
+# agent_team_machine_setup.sh
+# Interactive setup for your always-on Claude Code mini cluster.
+#
+# A machine can connect ONLY when ALL THREE are true:
+#   (1) it is in your private Tailscale network (tailnet)
+#   (2) it holds the cluster's authorized SSH key   <-- created & installed FOR you
+#   (3) it logs in as your account (default: amy)
+#
+# Just run it and answer the prompts:
+#     ./agent_team_machine_setup.sh
+# Or drive it non-interactively:
+#     ./agent_team_machine_setup.sh --role node   --name Liger --number 3
+#     ./agent_team_machine_setup.sh --role master
+#
+# Distribution: clone the repo, run the script. The repo carries only NON-secret
+# material (script, PUBLIC allow-list, manifest). PRIVATE keys live OUTSIDE the
+# repo in $AGENT_TEAM_SECRETS (default ~/.config/agent-team) and are NEVER pushed.
+#
+# Idempotent. Privileged steps use sudo (you are prompted once).
+set -euo pipefail
+
+# ------------------------------------------------------------------ defaults --
+ROLE="" ; NAME="" ; NUMBER=""
+LOGIN_USER="$(whoami)"
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+KEYS_FILE="$SELF_DIR/authorized_clients"          # shared PUBLIC-key allow-list (in repo)
+CLUSTER_FILE="$SELF_DIR/cluster.conf"             # shared machine manifest (in repo)
+# Private key material lives OUTSIDE the repo so it can never be committed:
+SECRETS_DIR="${AGENT_TEAM_SECRETS:-$HOME/.config/agent-team}"
+KEYS_DIR="$SECRETS_DIR/keys"                       # holds the managed access key (NOT in repo)
+ACCESS_PRIV="$KEYS_DIR/agentteam_access_ed25519"   # THE cluster access key (private)
+ACCESS_PUB="$ACCESS_PRIV.pub"
+NODE_KEY="$HOME/.ssh/id_ed25519"                   # this node's identity (peer mesh)
+MASTER_KEY="$HOME/.ssh/agentteam_access_ed25519"   # access key installed on the MASTER
+HARDEN_FILE="/etc/ssh/sshd_config.d/200-agent-team-hardening.conf"
+SSH_CFG="$HOME/.ssh/config"
+MARK_BEGIN="# >>> agent-team cluster (managed) >>>"
+MARK_END="# <<< agent-team cluster (managed) <<<"
+DO_TAILSCALE=1 ; DRY_RUN=0 ; FORCE=0 ; INTERACTIVE="auto" ; LOGIN_SERVER=""
+
+usage() {
+  cat <<USAGE
+Usage: $(basename "$0") [options]
+Runs an interactive wizard by default. Flags below skip the questions.
+
+  --role node|master   node = a mini you SSH INTO; master = machine you SSH FROM
+  --name <Name>        (node) display name, e.g. Liger
+  --number <N>         (node) machine number, e.g. 3
+  --user <user>        login/SSH user to allow         (default: $LOGIN_USER)
+  --login-server <url> use a self-hosted Headscale instead of Tailscale's cloud
+  --keys-file <path>   shared allow-list                (default: $KEYS_FILE)
+  --cluster-file <path> shared manifest                 (default: $CLUSTER_FILE)
+  --secrets-dir <path> where PRIVATE keys live          (default: $SECRETS_DIR)
+  --no-tailscale       skip Tailscale (LAN-only)
+  --interactive        force the wizard
+  --non-interactive    never prompt (use flags/defaults)
+  --force              proceed despite an empty allow-list (lockout risk)
+  --dry-run            print actions; change nothing
+  -h, --help           this help
+USAGE
+}
+
+# -------------------------------------------------------------------- parse ---
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --role)          ROLE="$2"; shift 2;;
+    --name)          NAME="$2"; shift 2;;
+    --number)        NUMBER="$2"; shift 2;;
+    --user)          LOGIN_USER="$2"; shift 2;;
+    --login-server)  LOGIN_SERVER="$2"; shift 2;;
+    --keys-file)     KEYS_FILE="$2"; shift 2;;
+    --cluster-file)  CLUSTER_FILE="$2"; shift 2;;
+    --secrets-dir)   SECRETS_DIR="$2"; shift 2;;
+    --no-tailscale)  DO_TAILSCALE=0; shift;;
+    --interactive)   INTERACTIVE=1; shift;;
+    --non-interactive) INTERACTIVE=0; shift;;
+    --force)         FORCE=1; shift;;
+    --dry-run)       DRY_RUN=1; shift;;
+    -h|--help)       usage; exit 0;;
+    *) echo "Unknown argument: $1" >&2; usage; exit 1;;
+  esac
+done
+
+[ "$(id -u)" -ne 0 ] || { echo "ERROR: run as your normal user (it will sudo when needed), not root." >&2; exit 1; }
+
+# Recompute private-key paths in case --secrets-dir changed SECRETS_DIR.
+KEYS_DIR="$SECRETS_DIR/keys"
+ACCESS_PRIV="$KEYS_DIR/agentteam_access_ed25519"
+ACCESS_PUB="$ACCESS_PRIV.pub"
+# Accept friendly aliases for the master role.
+case "$ROLE" in client|portable|p) ROLE="master";; esac
+
+# --------------------------------------------------------- helpers ------------
+run()  { echo "  + $*"; [ $DRY_RUN -eq 1 ] || eval "$@"; }
+srun() { echo "  + sudo $*"; [ $DRY_RUN -eq 1 ] || sudo bash -c "$*"; }
+count_keys() { { grep -vE '^[[:space:]]*#' "$1" 2>/dev/null || true; } | awk 'NF>=2' | wc -l | tr -d ' '; }
+say()  { echo "$*" >&2; }
+# ask <question> [default] -> echoes the answer on stdout (prompt goes to stderr)
+ask() {
+  local q="$1" def="${2:-}" ans
+  if [ -n "$def" ]; then printf "  %s [%s]: " "$q" "$def" >&2; else printf "  %s: " "$q" >&2; fi
+  IFS= read -r ans || ans=""
+  echo "${ans:-$def}"
+}
+askyn() { local a; a="$(ask "$1 (y/n)" "${2:-y}")"; case "$a" in y*|Y*) return 0;; *) return 1;; esac; }
+
+# Decide whether to run the wizard
+if [ "$INTERACTIVE" = "auto" ]; then
+  if { [ -z "$ROLE" ] || { [ "$ROLE" = "node" ] && [ -z "$NAME" ]; }; } && [ -t 0 ]; then
+    INTERACTIVE=1; else INTERACTIVE=0; fi
+fi
+
+# ---------------------------------------------------------- the wizard --------
+if [ "$INTERACTIVE" = "1" ]; then
+  say ""
+  say "=============================================================="
+  say "  agent-team cluster setup"
+  say "=============================================================="
+  say "  A machine can connect only when ALL THREE are true:"
+  say "    (1) it is in your private Tailscale network"
+  say "    (2) it holds the cluster's authorized SSH key  <- I do this for you"
+  say "    (3) it logs in as the '$LOGIN_USER' account"
+  say "  I'll set those up now. (Privileged steps will ask for your password.)"
+  say ""
+  if [ -z "$ROLE" ]; then
+    say "  What is THIS machine?"
+    say "    [1] A cluster NODE   — an always-on Mac mini you SSH INTO"
+    say "    [2] The MASTER       — the machine you SSH FROM (you carry it)"
+    case "$(ask "Choose 1 or 2" "1")" in 2|master|client|portable|p|m) ROLE="master";; *) ROLE="node";; esac
+  fi
+  LOGIN_USER="$(ask "Login/SSH user to allow" "$LOGIN_USER")"
+  if [ "$ROLE" = "node" ]; then
+    [ -n "$NAME" ]   || NAME="$(ask "Machine name (e.g. Liger)" "$(scutil --get ComputerName 2>/dev/null || echo)")"
+    [ -n "$NUMBER" ] || NUMBER="$(ask "Machine number (e.g. 3)" "")"
+  else
+    NAME="${NAME:-$(scutil --get LocalHostName 2>/dev/null || hostname -s)}"
+  fi
+  if askyn "Use Tailscale for the encrypted network?" "y"; then
+    DO_TAILSCALE=1
+    if askyn "  Use a self-hosted Headscale server instead of Tailscale's cloud?" "n"; then
+      LOGIN_SERVER="$(ask "  Headscale URL (e.g. https://hs.example.com)" "$LOGIN_SERVER")"
+    fi
+  else
+    DO_TAILSCALE=0
+  fi
+  say ""
+fi
+
+# ------------------------------------------------------- validate -------------
+[ -n "$ROLE" ] || ROLE="node"
+case "$ROLE" in node|master) :;; *) echo "ERROR: --role must be node or master" >&2; exit 1;; esac
+if [ "$ROLE" = "node" ]; then
+  [ -n "$NAME" ]   || { echo "ERROR: node setup needs --name" >&2; exit 1; }
+  [ -n "$NUMBER" ] || { echo "ERROR: node setup needs --number" >&2; exit 1; }
+  [[ "$NUMBER" =~ ^[0-9]+$ ]] || { echo "ERROR: --number must be an integer" >&2; exit 1; }
+  [[ "$NAME" =~ ^[A-Za-z][A-Za-z0-9]*$ ]] || { echo "ERROR: --name must be alphanumeric" >&2; exit 1; }
+  LOCAL="$(echo "$NAME" | tr '[:upper:]' '[:lower:]')-$NUMBER"   # liger-3
+  SHORT="$(echo "$NAME" | tr '[:upper:]' '[:lower:]')"           # liger
+else
+  LOCAL="$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
+  SHORT="$LOCAL"
+fi
+
+echo "============================================================"
+echo "  role: $ROLE    name: $NAME    tailnet name: $LOCAL"
+echo "  login user: $LOGIN_USER    tailscale: $([ $DO_TAILSCALE -eq 1 ] && echo yes || echo no)$([ -n "$LOGIN_SERVER" ] && echo " (headscale: $LOGIN_SERVER)")"
+echo "  dry-run: $([ $DRY_RUN -eq 1 ] && echo YES || echo no)"
+echo "============================================================"
+
+NEED_SUDO=0; { [ "$ROLE" = "node" ] || [ $DO_TAILSCALE -eq 1 ]; } && NEED_SUDO=1
+[ $DRY_RUN -eq 1 ] || [ $NEED_SUDO -eq 0 ] || sudo -v
+
+# ---------------------------------------------- 1. packages -------------------
+echo; echo "==> Packages (autossh, tmux, mosh$([ $DO_TAILSCALE -eq 1 ] && echo ', tailscale'))"
+if command -v brew >/dev/null 2>&1; then
+  PKGS="autossh tmux mosh"; [ $DO_TAILSCALE -eq 1 ] && PKGS="$PKGS tailscale"
+  run "brew install $PKGS || true"
+else
+  echo "  ! Homebrew not found — install from https://brew.sh first." >&2
+  [ $FORCE -eq 1 ] || exit 1
+fi
+
+# --------------------- 2. THE managed cluster access key (condition 2) --------
+# Created once, stored in this control dir, reused everywhere. The user never
+# runs ssh-keygen or copies a key.
+echo; echo "==> Cluster access key (managed automatically)"
+run "mkdir -p '$KEYS_DIR'"; run "chmod 700 '$KEYS_DIR'"
+if [ ! -f "$ACCESS_PRIV" ]; then
+  TAG="$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z' | cut -c1-8 || echo $$)"
+  run "ssh-keygen -t ed25519 -a 100 -N '' -C 'agentteam-access-$TAG' -f '$ACCESS_PRIV'"
+  echo "    Created a unique cluster access key (agentteam-access-$TAG)."
+else
+  echo "    Reusing existing cluster access key."
+fi
+# Make sure its PUBLIC half is in the shared allow-list (so every node trusts it).
+if [ $DRY_RUN -eq 0 ] && [ -f "$ACCESS_PUB" ]; then
+  touch "$KEYS_FILE"
+  if ! awk '{print $2}' "$KEYS_FILE" | grep -qxF "$(awk '{print $2}' "$ACCESS_PUB")"; then
+    cat "$ACCESS_PUB" >> "$KEYS_FILE"; echo "    Added access key to the shared allow-list."
+  fi
+fi
+
+# --------------------------------------------- 2b. ~/.ssh skeleton -----------
+echo; echo "==> ~/.ssh skeleton"
+run "mkdir -p '$HOME/.ssh'"; run "chmod 700 '$HOME/.ssh'"
+run "touch '$HOME/.ssh/authorized_keys'"; run "chmod 600 '$HOME/.ssh/authorized_keys'"
+
+# =============================================================== NODE ROLE ====
+if [ "$ROLE" = "node" ]; then
+  # This node's own identity key, for SSH between minis (peer mesh).
+  echo; echo "==> Node identity key (for peer SSH between minis)"
+  if [ ! -f "$NODE_KEY" ]; then
+    run "ssh-keygen -t ed25519 -a 100 -N '' -C '$LOCAL-node' -f '$NODE_KEY'"
+  else echo "    Reusing $NODE_KEY"; fi
+  if [ $DRY_RUN -eq 0 ] && [ -f "$NODE_KEY.pub" ]; then
+    if ! awk '{print $2}' "$KEYS_FILE" | grep -qxF "$(awk '{print $2}' "$NODE_KEY.pub")"; then
+      cat "$NODE_KEY.pub" >> "$KEYS_FILE"
+    fi
+  fi
+
+  # Condition (2): install the shared allow-list into authorized_keys.
+  echo; echo "==> Installing the authorized keys (condition 2)"
+  if [ $DRY_RUN -eq 0 ]; then
+    if [ "$(count_keys "$KEYS_FILE")" -eq 0 ] && [ $FORCE -eq 0 ]; then
+      echo "  ERROR: allow-list empty and key-only SSH would lock you out." >&2; exit 1
+    fi
+    tmp="$(mktemp)"
+    cat "$HOME/.ssh/authorized_keys" "$KEYS_FILE" 2>/dev/null \
+      | awk 'NF>=2 && $1 !~ /^#/ { if(!seen[$2]++) print }' > "$tmp"
+    install -m 600 "$tmp" "$HOME/.ssh/authorized_keys"; rm -f "$tmp"
+    echo "    authorized_keys now holds $(grep -c . "$HOME/.ssh/authorized_keys") key(s)."
+  fi
+
+  # Condition (3): name the box, enable SSH, restrict to the login user.
+  echo; echo "==> Hostname + Remote Login, restricted to '$LOGIN_USER' (condition 3)"
+  srun "scutil --set ComputerName '$NAME'"
+  srun "scutil --set LocalHostName '$LOCAL'"
+  srun "scutil --set HostName '$LOCAL'"
+  srun "dscacheutil -flushcache || true"
+  srun "systemsetup -setremotelogin on"
+  srun "dseditgroup -o create -q com.apple.access_ssh 2>/dev/null || true"
+  srun "dseditgroup -o edit -a '$LOGIN_USER' -t user com.apple.access_ssh 2>/dev/null || true"
+
+  echo; echo "==> Key-only SSH hardening"
+  if [ $DRY_RUN -eq 0 ]; then
+    tmpconf="$(mktemp)"
+    cat > "$tmpconf" <<CONF
+# agent-team SSH hardening (managed by agent_team_machine_setup.sh)
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+AuthenticationMethods publickey
+AllowUsers $LOGIN_USER
+MaxAuthTries 3
+MaxSessions 20
+LoginGraceTime 30
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding yes
+PermitTunnel no
+ClientAliveInterval 30
+ClientAliveCountMax 6
+TCPKeepAlive yes
+CONF
+    sudo install -m 644 -o root -g wheel "$tmpconf" "$HARDEN_FILE"; rm -f "$tmpconf"
+    sudo /usr/sbin/sshd -t && echo "    sshd config valid"
+    sudo launchctl kickstart -k system/com.openssh.sshd 2>/dev/null || true
+  else echo "  + (dry-run) would write $HARDEN_FILE with AllowUsers $LOGIN_USER"; fi
+
+  echo; echo "==> Always-on power tuning + firewall"
+  srun "pmset -c sleep 0"; srun "pmset -c disksleep 0"; srun "pmset -c displaysleep 2"
+  srun "pmset -c powernap 1"; srun "pmset -c womp 1"
+  srun "pmset -a autorestart 1"; srun "pmset -a tcpkeepalive 1"
+  FW=/usr/libexec/ApplicationFirewall/socketfilterfw
+  srun "$FW --setglobalstate on >/dev/null"; srun "$FW --setstealthmode on >/dev/null"
+  srun "$FW --setallowsigned on >/dev/null"; srun "$FW --setallowsignedapp on >/dev/null"
+fi
+
+# ------------------------------------- Condition (1): join the tailnet --------
+if [ $DO_TAILSCALE -eq 1 ]; then
+  echo; echo "==> Joining your Tailscale network (condition 1)"
+  srun "tailscaled install-system-daemon || true"
+  UP="tailscale up --hostname $LOCAL"; [ -n "$LOGIN_SERVER" ] && UP="$UP --login-server $LOGIN_SERVER"
+  echo "  A sign-in URL will appear — open it and approve '$LOCAL' in the admin console."
+  [ $DRY_RUN -eq 1 ] || sudo $UP || true
+fi
+
+# ------------------------------------------ cluster manifest + ssh shortcuts --
+if [ "$ROLE" = "node" ] && [ $DRY_RUN -eq 0 ]; then
+  touch "$CLUSTER_FILE"
+  grep -q "^$NUMBER|" "$CLUSTER_FILE" 2>/dev/null || echo "$NUMBER|$NAME|$LOCAL|$(date +%Y-%m-%d)" >> "$CLUSTER_FILE"
+  sort -t'|' -k1,1n -o "$CLUSTER_FILE" "$CLUSTER_FILE"
+fi
+
+# On the MASTER, install the access key locally so 'ssh <node>' just works.
+IDENTITY="$NODE_KEY"
+if [ "$ROLE" = "master" ]; then
+  echo; echo "==> Installing the cluster access key on this MASTER"
+  if [ $DRY_RUN -eq 0 ]; then
+    install -m 600 "$ACCESS_PRIV" "$MASTER_KEY"
+    install -m 644 "$ACCESS_PUB"  "$MASTER_KEY.pub"
+    echo "    Installed $MASTER_KEY (you never have to touch it)."
+  fi
+  IDENTITY="$MASTER_KEY"
+fi
+
+# (Re)write the managed cluster block in ~/.ssh/config: ssh <name> for every mini.
+if [ $DRY_RUN -eq 0 ] && [ -s "$CLUSTER_FILE" ]; then
+  touch "$SSH_CFG"; chmod 600 "$SSH_CFG"
+  tmpcfg="$(mktemp)"
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '$0==b{skip=1} !skip{print} $0==e{skip=0}' "$SSH_CFG" > "$tmpcfg"
+  {
+    echo "$MARK_BEGIN"
+    while IFS='|' read -r n nm lc dt; do
+      [ -z "$n" ] && continue
+      sn="$(echo "$nm" | tr '[:upper:]' '[:lower:]')"
+      echo "Host $sn $lc"
+      echo "    HostName $lc"
+      echo "    User $LOGIN_USER"
+      echo "    IdentityFile $IDENTITY"
+      echo "    IdentitiesOnly yes"
+      echo "    ServerAliveInterval 30"
+      echo "    ServerAliveCountMax 3"
+      echo "    StrictHostKeyChecking accept-new"
+    done < "$CLUSTER_FILE"
+    echo "$MARK_END"
+  } >> "$tmpcfg"
+  install -m 600 "$tmpcfg" "$SSH_CFG"; rm -f "$tmpcfg"
+  echo; echo "==> Wrote 'ssh <name>' shortcuts to $SSH_CFG for: $(awk -F'|' '{printf "%s ",tolower($2)}' "$CLUSTER_FILE")"
+fi
+
+# ----------------------------------------------------- tmux (node) -----------
+if [ "$ROLE" = "node" ] && [ $DRY_RUN -eq 0 ]; then cat > "$HOME/.tmux.conf" <<TMUX
+# ~/.tmux.conf — $NAME (agent-team mini #$NUMBER) — persistent Claude Code sessions
+set -g history-limit 200000
+set -g destroy-unattached off
+set -g default-terminal "tmux-256color"
+set -ga terminal-overrides ",xterm-256color:Tc,iTerm.app:Tc"
+set -sg escape-time 10
+setw -g aggressive-resize on
+set -g mouse on
+set -g renumber-windows on
+set -g base-index 1
+set -g status-interval 5
+set -g status-right "#[bold]$NAME (mini #$NUMBER)#[default] | %H:%M %d-%b"
+set -g status-style "bg=colour24,fg=white"
+bind r source-file ~/.tmux.conf \\; display "tmux.conf reloaded"
+TMUX
+fi
+
+# ------------------------------------------------ verification checklist ------
+echo; echo "==> Verifying the three conditions"
+if [ $DRY_RUN -eq 1 ]; then
+  echo "  (dry-run) skipped live checks."
+else
+  # (1) tailnet
+  if [ $DO_TAILSCALE -eq 0 ]; then echo "  [—] (1) tailnet: skipped (LAN-only)"
+  elif tailscale status >/dev/null 2>&1; then echo "  [OK] (1) in the tailnet"
+  else echo "  [!!] (1) NOT in the tailnet yet — finish 'tailscale up' sign-in."; fi
+  # (2) authorized key
+  if [ "$ROLE" = "node" ]; then
+    if awk '{print $2}' "$HOME/.ssh/authorized_keys" 2>/dev/null | grep -qxF "$(awk '{print $2}' "$ACCESS_PUB" 2>/dev/null)"; then
+      echo "  [OK] (2) holds the cluster access key in authorized_keys"
+    else echo "  [!!] (2) access key NOT in authorized_keys"; fi
+  else
+    [ -f "$MASTER_KEY" ] && echo "  [OK] (2) cluster access key installed at $MASTER_KEY" || echo "  [!!] (2) access key not installed"
+  fi
+  # (3) user
+  if id "$LOGIN_USER" >/dev/null 2>&1; then echo "  [OK] (3) login user '$LOGIN_USER' exists$([ "$ROLE" = node ] && echo " and is the only AllowUsers")"
+  else echo "  [!!] (3) user '$LOGIN_USER' not found"; fi
+fi
+
+# --------------------------------------------------------------- summary ------
+echo
+echo "============================================================"
+if [ "$ROLE" = "node" ]; then
+  echo "  DONE: $NAME (mini #$NUMBER) is a cluster node."
+  echo "  Reach it later with:  ssh $SHORT   (from the MASTER or any mini)"
+  echo "  Cluster now contains:"
+  [ -s "$CLUSTER_FILE" ] && awk -F'|' '{printf "     #%s  %-10s %s\n",$1,$2,$3}' "$CLUSTER_FILE"
+  echo
+  echo "  NEXT: commit & push the updated authorized_clients + cluster.conf, then"
+  echo "        'git pull' on the next mini and run this again."
+else
+  echo "  DONE: this MASTER can now reach the cluster. Try:  ssh <name>"
+  echo "  Known machines:"
+  [ -s "$CLUSTER_FILE" ] && awk -F'|' '{printf "     #%s  %-10s -> ssh %s\n",$1,$2,tolower($2)}' "$CLUSTER_FILE"
+fi
+echo
+echo "  SECURITY: the PRIVATE access key lives in '$KEYS_DIR'"
+echo "  (outside the git repo — never committed). Back it up to your password"
+echo "  manager / encrypted USB. Anyone holding it can SSH to the cluster."
+echo "  To revoke: delete that key, remove its line from authorized_clients,"
+echo "  commit & push, then re-run this on each node."
+echo "============================================================"

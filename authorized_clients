@@ -1,0 +1,11 @@
+# agent-team — SHARED SSH allow-list (PUBLIC keys only — safe to commit)
+# Every node installs THIS list into its ~/.ssh/authorized_keys, so the same
+# machines may connect everywhere. Public keys cannot authenticate by themselves,
+# so this file is not secret. (Private keys NEVER go here or in the repo.)
+#
+# Entries are added automatically by agent_team_machine_setup.sh:
+#   1. The cluster ACCESS key  — the master's managed key (created for you).
+#   2. Each mini's identity key — so the minis form a peer cluster.
+#
+# After setup, commit & push this file so other nodes can `git pull` it.
+# (Lines starting with # are ignored.)
