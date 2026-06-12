@@ -10,3 +10,4 @@
 # After setup, commit & push this file so other nodes can `git pull` it.
 # (Lines starting with # are ignored.)
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII96KziXzn1NnsW1TzAteUPDFOhQZuxuSKg3EjDeRjhm foramyhua@gmail.com elga-1-node
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN0WBDnrGKNrPtrj/EYioVSHgsX8inhUYNDNgJ+moZVT nora-2-node
