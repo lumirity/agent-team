@@ -26,11 +26,12 @@
 set -euo pipefail
 
 # ------------------------------------------------------------------ defaults --
-ROLE="" ; NAME="" ; NUMBER="" ; SIGNER=""
+ROLE="" ; NAME="" ; NUMBER="" ; SIGNER="" ; LINEAR_ASSIGNEE=""
 LOGIN_USER="$(whoami)"
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 KEYS_FILE="$SELF_DIR/authorized_clients"          # shared PUBLIC-key allow-list (in repo)
 CLUSTER_FILE="$SELF_DIR/cluster.conf"             # shared machine manifest (in repo)
+AGENTS_DIR="$SELF_DIR/agents"                     # shared per-machine config overlay (in repo)
 # Private key material lives OUTSIDE the repo so it can never be committed:
 SECRETS_DIR="${AGENT_TEAM_SECRETS:-$HOME/.config/agent-team}"
 KEYS_DIR="$SECRETS_DIR/keys"                       # holds the managed access key (NOT in repo)
@@ -42,6 +43,9 @@ HARDEN_FILE="/etc/ssh/sshd_config.d/200-agent-team-hardening.conf"
 SSH_CFG="$HOME/.ssh/config"
 MARK_BEGIN="# >>> agent-team cluster (managed) >>>"
 MARK_END="# <<< agent-team cluster (managed) <<<"
+PROF_BEGIN="# >>> agent-team identity (managed) >>>"
+PROF_END="# <<< agent-team identity (managed) <<<"
+ID_FILE="$SECRETS_DIR/identity"                    # stable "which machine am I" handle
 DO_TAILSCALE=1 ; DRY_RUN=0 ; FORCE=0 ; INTERACTIVE="auto" ; LOGIN_SERVER=""
 
 usage() {
@@ -54,6 +58,8 @@ Runs an interactive wizard by default. Flags below skip the questions.
   --number <N>         (node) machine number, e.g. 3
   --user <user>        login/SSH user to allow         (default: $LOGIN_USER)
   --sign <name>        sign the registration commit, e.g. --sign "Amy Hua"
+  --linear <assignee>  Linear assignee for tasks routed to this machine (stored in
+                       shared agent state; e.g. --linear you@example.com)
   --login-server <url> use a self-hosted Headscale instead of Tailscale's cloud
   --keys-file <path>   shared allow-list                (default: $KEYS_FILE)
   --cluster-file <path> shared manifest                 (default: $CLUSTER_FILE)
@@ -75,6 +81,7 @@ while [ $# -gt 0 ]; do
     --number)        NUMBER="$2"; shift 2;;
     --user)          LOGIN_USER="$2"; shift 2;;
     --sign)          SIGNER="$2"; shift 2;;
+    --linear)        LINEAR_ASSIGNEE="$2"; shift 2;;
     --login-server)  LOGIN_SERVER="$2"; shift 2;;
     --keys-file)     KEYS_FILE="$2"; shift 2;;
     --cluster-file)  CLUSTER_FILE="$2"; shift 2;;
@@ -95,6 +102,7 @@ done
 KEYS_DIR="$SECRETS_DIR/keys"
 ACCESS_PRIV="$KEYS_DIR/agentteam_access_ed25519"
 ACCESS_PUB="$ACCESS_PRIV.pub"
+ID_FILE="$SECRETS_DIR/identity"
 # Accept friendly aliases for the master role.
 case "$ROLE" in client|portable|p) ROLE="master";; esac
 GH_KEY="$HOME/.ssh/github_ed25519"                 # this machine's GitHub key
@@ -221,7 +229,7 @@ git_register_push() {
   if [ "$GIT_SYNC" != 1 ]; then echo "  (git sync off — commit & push authorized_clients/cluster.conf yourself)"; return 0; fi
   git_in_repo && git_has_origin || { echo "  (not a git checkout with an origin — skipping push)"; return 0; }
   echo; echo "==> Registering this machine in the repo (commit + push shared state)"
-  git -C "$SELF_DIR" add authorized_clients cluster.conf >/dev/null 2>&1 || true
+  git -C "$SELF_DIR" add authorized_clients cluster.conf agents >/dev/null 2>&1 || true
   if git -C "$SELF_DIR" diff --cached --quiet 2>/dev/null; then echo "    Nothing new to register."; return 0; fi
 
   # Show exactly what would be registered, then ask before committing/pushing.
@@ -237,14 +245,70 @@ git_register_push() {
     [ -n "$SIGNER" ] || SIGNER="$(ask "  Sign this commit as (blank to skip)" "$(git -C "$SELF_DIR" config user.name 2>/dev/null)")"
   fi
 
-  local msg="register $ROLE: $NAME${NUMBER:+ #$NUMBER} ($LOCAL)"
-  [ -n "$SIGNER" ] && msg="$msg
+  # Body carries machine-attribution trailers: which box this came from, and
+  # (optionally) who signed it. So any commit pushed from a mini is traceable.
+  local msg="register $ROLE: $NAME${NUMBER:+ #$NUMBER} ($LOCAL)
 
+Machine: $LOCAL"
+  [ -n "$SIGNER" ] && msg="$msg
 Signed by $SIGNER"
   git -C "$SELF_DIR" commit -q -m "$msg" || true
   git -C "$SELF_DIR" pull --rebase --autostash -q 2>/dev/null || true
   if git -C "$SELF_DIR" push -q 2>/dev/null; then echo "    ✓ Pushed registration to origin${SIGNER:+ (signed by $SIGNER)}."
   else echo "    ! Push failed — resolve and run: git -C '$SELF_DIR' push"; fi
+}
+
+# --- machine identity -------------------------------------------------------
+# A stable handle for THIS machine so anything on the box — a shell, a script,
+# Claude Code, a log line — can attribute its work without renaming the unix
+# account. Writes $ID_FILE (sourceable: exports AGENT_TEAM_MACHINE etc.) and
+# wires ~/.zshrc to source it, so $AGENT_TEAM_MACHINE is set in every shell.
+write_machine_identity() {
+  [ $DRY_RUN -eq 1 ] && { echo "  + (dry-run) would write machine identity to $ID_FILE"; return 0; }
+  echo; echo "==> Machine identity (so anything here can attribute work to '$LOCAL')"
+  mkdir -p "$SECRETS_DIR"
+  cat > "$ID_FILE" <<ID
+# agent-team machine identity (managed by agent_team_machine_setup.sh).
+# Source this (or read \$AGENT_TEAM_MACHINE) to attribute work to THIS machine.
+export AGENT_TEAM_MACHINE="$LOCAL"
+export AGENT_TEAM_NAME="$NAME"
+export AGENT_TEAM_NUMBER="${NUMBER:-}"
+export AGENT_TEAM_ROLE="$ROLE"
+ID
+  chmod 644 "$ID_FILE"
+  # Make every login shell source it (idempotent managed block in ~/.zshrc).
+  local prof="$HOME/.zshrc"; touch "$prof"
+  if ! grep -qF "$PROF_BEGIN" "$prof" 2>/dev/null; then
+    printf '\n%s\n[ -f "%s" ] && . "%s"\n%s\n' "$PROF_BEGIN" "$ID_FILE" "$ID_FILE" "$PROF_END" >> "$prof"
+  fi
+  echo "    Wrote $ID_FILE  (AGENT_TEAM_MACHINE=$LOCAL); ~/.zshrc sources it."
+}
+
+# --- shared agent state -----------------------------------------------------
+# Mirror this machine's config into the repo as agents/<short>.env, so any
+# machine can look it up with get_agent_config.sh after a pull (the local
+# identity file is private to this box; this is the shared, committed copy).
+# Carries the same AGENT_TEAM_* keys plus an (optional) Linear assignee.
+write_shared_agent_state() {
+  [ $DRY_RUN -eq 1 ] && { echo "  + (dry-run) would write shared agent state to $AGENTS_DIR/$SHORT.env"; return 0; }
+  echo; echo "==> Shared agent state ($AGENTS_DIR/$SHORT.env — committed, looked up by get_agent_config.sh)"
+  mkdir -p "$AGENTS_DIR"
+  local f="$AGENTS_DIR/$SHORT.env"
+  # Preserve an existing Linear assignee if this run didn't supply one.
+  if [ -z "$LINEAR_ASSIGNEE" ] && [ -f "$f" ]; then
+    LINEAR_ASSIGNEE="$(sed -n 's/^[[:space:]]*\(export[[:space:]]*\)\{0,1\}AGENT_TEAM_LINEAR_ASSIGNEE=//p' "$f" | tr -d '"' | head -1)"
+  fi
+  cat > "$f" <<STATE
+# agent-team shared state for $NAME — managed by agent_team_machine_setup.sh.
+# Non-secret. Read with: ./get_agent_config.sh --name $SHORT
+AGENT_TEAM_MACHINE=$LOCAL
+AGENT_TEAM_NAME=$NAME
+AGENT_TEAM_NUMBER=${NUMBER:-}
+AGENT_TEAM_ROLE=$ROLE
+AGENT_TEAM_LINEAR_ASSIGNEE=$LINEAR_ASSIGNEE
+STATE
+  chmod 644 "$f"
+  echo "    Wrote $f${LINEAR_ASSIGNEE:+  (Linear assignee: $LINEAR_ASSIGNEE)}."
 }
 
 # Decide whether to run the wizard
@@ -312,6 +376,14 @@ echo "============================================================"
 
 NEED_SUDO=0; { [ "$ROLE" = "node" ] || [ $DO_TAILSCALE -eq 1 ]; } && NEED_SUDO=1
 [ $DRY_RUN -eq 1 ] || [ $NEED_SUDO -eq 0 ] || sudo -v
+
+# Stamp this machine's identity early, so it exists even if a later step fails.
+write_machine_identity
+# Optional: who should Linear tasks routed to this machine be assigned to?
+if [ "$INTERACTIVE" = "1" ] && [ -z "$LINEAR_ASSIGNEE" ] && [ $DRY_RUN -eq 0 ]; then
+  LINEAR_ASSIGNEE="$(ask "Linear assignee for tasks routed to '$SHORT' (email/id, blank to skip)" "")"
+fi
+write_shared_agent_state
 
 # ---------------------------------------------- 1. packages -------------------
 echo; echo "==> Packages (git, autossh, tmux, mosh$([ $DO_TAILSCALE -eq 1 ] && echo ', tailscale'))"
@@ -557,6 +629,13 @@ else
   echo "  Known machines:"
   [ -s "$CLUSTER_FILE" ] && awk -F'|' '{printf "     #%s  %-10s -> ssh %s\n",$1,$2,tolower($2)}' "$CLUSTER_FILE"
 fi
+echo
+echo "  IDENTITY: this machine is '\$AGENT_TEAM_MACHINE' = $LOCAL (open a new shell"
+echo "  to pick it up). Use it to attribute work to this box; commits pushed from"
+echo "  here carry a 'Machine: $LOCAL' trailer."
+echo "  SHARED STATE: any machine can look up this config after a pull:"
+echo "      ./get_agent_config.sh --name $SHORT            # all AGENT_TEAM_* keys"
+echo "      ./get_agent_config.sh --name $SHORT --key LINEAR_ASSIGNEE"
 echo
 # The PRIVATE access key exists ONLY on the master (it is generated during a
 # master run into $KEYS_DIR). A node never holds it — it only installs the

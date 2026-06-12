@@ -26,6 +26,8 @@ single source of truth — and it stores **only non-secret data**:
 |------|-----------------------|
 | `authorized_clients` | The **public-key allow-list** — every key permitted to SSH into any node (the master's access key + each node's identity key). Public keys can't authenticate on their own, so this is not secret. |
 | `cluster.conf` | The **machine manifest** — one line per machine (`NUMBER\|NAME\|LOCAL\|date`), i.e. the roster. |
+| `agents/<name>.env` | The **shared agent-state overlay** — one file per machine holding its `AGENT_TEAM_*` config (machine id, role, Linear assignee, and any custom keys). Read with `get_agent_config.sh`. Non-secret. |
+| `get_agent_config.sh` | Accessor that resolves and prints any machine's config (see *Shared agent state* below). |
 | `agent_team_machine_setup.sh`, `.gitignore`, `README.md` | The tooling and docs. |
 
 Every time you run the setup script on a machine, it:
@@ -109,10 +111,16 @@ Run `./agent_team_machine_setup.sh` (wizard) or pass flags. In order, it:
      encrypted USB) before continuing, installs it locally, and writes
      `ssh <name>` shortcuts for every machine.
 5. **Joins Tailscale** (or a self-hosted Headscale via `--login-server`).
-6. **Self-heals keys** — if an SSH key was deleted or corrupted, it's backed up,
+6. **Stamps this machine's identity** — writes `~/.config/agent-team/identity`
+   and sources it from `~/.zshrc`, so `$AGENT_TEAM_MACHINE` (and `_NAME`,
+   `_NUMBER`, `_ROLE`) is set in every shell. Also mirrors the same config into
+   the repo as `agents/<name>.env` so other machines can look it up.
+7. **Self-heals keys** — if an SSH key was deleted or corrupted, it's backed up,
    regenerated, and its stale allow-list entry is replaced with the new one.
-7. **Commits & pushes** the updated `authorized_clients` + `cluster.conf` so the
-   rest of the cluster sees this machine.
+8. **Commits & pushes** the updated `authorized_clients`, `cluster.conf`, and
+   `agents/` — but **asks first** (in interactive mode) before committing, lets
+   you **sign** the commit (`Signed by <name>`), and tags it with a
+   `Machine: <name>` trailer so the push is attributable to this box.
 
 It is **idempotent** — safe to re-run anytime (e.g. to recover a lost key or
 refresh shortcuts).
@@ -202,6 +210,50 @@ troubleshooting: `../SSH_SETUP.md`.
 
 ---
 
+## Shared agent state
+
+Each machine has a stable identity you can attribute work to — **without** giving
+it its own unix account. The setup script writes it in two places:
+
+- **Local, private** — `~/.config/agent-team/identity`, sourced from `~/.zshrc`,
+  so every shell on the box has `$AGENT_TEAM_MACHINE` (plus `_NAME`, `_NUMBER`,
+  `_ROLE`). Use it in scripts, prompts, or to attribute work to "this machine".
+- **Shared, committed** — `agents/<name>.env` in the repo, so *any* machine can
+  look up *any other* machine's config after a `git pull`.
+
+Read it from anywhere with **`get_agent_config.sh`**:
+
+```bash
+./get_agent_config.sh                          # THIS machine
+./get_agent_config.sh --name nora              # a specific machine, as key=value
+./get_agent_config.sh --name nora --key LINEAR_ASSIGNEE   # one value (prefix optional)
+eval "$(./get_agent_config.sh --name nora --export)"      # load into your shell
+./get_agent_config.sh --name nora --json       # JSON object
+./get_agent_config.sh --list                   # every known machine
+```
+
+It merges three sources, **later wins**: `cluster.conf` → `agents/<name>.env` →
+the local `~/.config/agent-team/identity` (only when you query the current box).
+It *sources* only the local identity file (which this box wrote); shared
+`agents/*.env` overlays are parsed, never executed.
+
+**Extensible keys.** Overlays accept any `AGENT_TEAM_*` key, and they all surface
+in the output. Add your own (e.g. `AGENT_TEAM_GPU=none`) by editing the file and
+committing it.
+
+**Routing Linear tasks per machine.** Store who a machine's tasks go to in
+`AGENT_TEAM_LINEAR_ASSIGNEE` — set it with `--linear <assignee>` at setup (or the
+interactive prompt), or edit `agents/<name>.env`. Then fetch it when assigning:
+
+```bash
+./get_agent_config.sh --name nora --key LINEAR_ASSIGNEE
+```
+
+Commits pushed from a machine carry a `Machine: <name>` trailer, so cluster
+changes are traceable to the box that made them.
+
+---
+
 ## Recovering a lost or corrupted key
 
 Just re-run the script on that machine:
@@ -236,6 +288,8 @@ full revocation.)
   --name <Name>         (node) display name, e.g. Liger
   --number <N>          (node) machine number, e.g. 3
   --user <user>         login/SSH user to allow            (default: amy)
+  --sign <name>         sign the registration commit, e.g. --sign "Amy Hua"
+  --linear <assignee>   Linear assignee for tasks routed to this machine
   --login-server <url>  use a self-hosted Headscale instead of Tailscale's cloud
   --secrets-dir <path>  where PRIVATE keys live   (default: ~/.config/agent-team)
   --no-tailscale        LAN-only (skip Tailscale)
@@ -244,4 +298,8 @@ full revocation.)
   --dry-run             print actions; change nothing
 ```
 
-Current cluster: see `cluster.conf` (Nora is mini #2).
+```
+./get_agent_config.sh [--name <name>] [--key <KEY>] [--export|--json] [--list]
+```
+
+Current cluster: see `cluster.conf` (Elga is mini #1, Nora is mini #2).
