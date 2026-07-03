@@ -292,6 +292,79 @@ changes are traceable to the box that made them.
 
 ---
 
+## Troubleshooting: `ssh <node>` → `Permission denied (publickey)`
+
+**Symptom.** From the master, `ssh elga` (or any node) fails with
+`Permission denied (publickey)`, even though `tailscale status` shows the node
+online and `ssh -v` shows the connection *is established* and the access key *is
+offered*. The network is fine; the node just doesn't trust the key yet.
+
+**Cause — allow-list drift.** A node only trusts the keys that were in
+`authorized_clients` **at the time it last ran the installer**. If a client key was
+added *after* that — most commonly the **master/orchestrator was set up after the
+nodes already existed**, so its access key didn't exist when they registered — the
+node's `~/.ssh/authorized_keys` never received it. The master offers the right key;
+the node has no matching line; sshd denies it. (Verify the ordering with
+`git log --oneline -- authorized_clients` — if the `agentteam-access-*` line landed
+in a commit *newer* than a node's `register node:` commit, that node is stale.)
+
+> **Rule for any new client key.** Whenever a key is added to `authorized_clients`
+> — a new/re-keyed master, or any additional client — **every existing node must
+> re-pull and re-run the installer** to start trusting it. Setting the master up
+> *first* avoids this; when that isn't possible, use the fix below.
+
+**Why it can't be fixed from the master.** SSH is the broken path, key-only
+hardening means no password fallback, and the master holds only the *access* key
+(not a node *identity* key), so it can't hop in via another node either. **The fix
+must run on each node directly** — physical access, Screen Sharing/VNC, or any
+existing terminal/tmux session on that box (e.g. a fresh Claude Code session
+running *on the node itself*).
+
+### The fix — run these ON the node (not over SSH from the master)
+
+Each node re-pulls the updated allow-list and re-runs its installer, which rewrites
+`~/.ssh/authorized_keys` from `authorized_clients`. It's idempotent.
+
+**On Elga (mini #1):**
+
+```bash
+cd ~/agent-team
+git pull
+./agent_team_machine_setup.sh --role node --name Elga --number 1
+```
+
+**On Nora (mini #2):**
+
+```bash
+cd ~/agent-team
+git pull
+./agent_team_machine_setup.sh --role node --name Nora --number 2
+```
+
+**Any future node** — substitute its own name/number (a node always knows its own
+identity via `./get_agent_config.sh --key NAME` and `--key NUMBER`, or
+`$AGENT_TEAM_NAME` / `$AGENT_TEAM_NUMBER`):
+
+```bash
+cd ~/agent-team && git pull
+./agent_team_machine_setup.sh --role node --name "$AGENT_TEAM_NAME" --number "$AGENT_TEAM_NUMBER"
+```
+
+**Minimal alternative** (skips the full wizard — just re-installs the allow-list;
+de-dupe-safe because the installer merges by key body):
+
+```bash
+cd ~/agent-team && git pull
+grep agentteam-access authorized_clients >> ~/.ssh/authorized_keys
+```
+
+After the node applies this, `ssh <node>` from the master authenticates. If it
+still fails, confirm the node is on the tailnet (`tailscale status`) and that the
+key the master offers (`ssh-keygen -lf ~/.ssh/agentteam_access_ed25519.pub`)
+matches an `agentteam-access-*` line in the node's `~/.ssh/authorized_keys`.
+
+---
+
 ## Recovering a lost or corrupted key
 
 Just re-run the script on that machine:
