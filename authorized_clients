@@ -11,3 +11,4 @@
 # (Lines starting with # are ignored.)
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII96KziXzn1NnsW1TzAteUPDFOhQZuxuSKg3EjDeRjhm foramyhua@gmail.com elga-1-node
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN0WBDnrGKNrPtrj/EYioVSHgsX8inhUYNDNgJ+moZVT nora-2-node
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB79B3MPw3mc+KOkX86oSU30HzTYtcWfyBM0G7wxxlQu agentteam-access-f5e1330c

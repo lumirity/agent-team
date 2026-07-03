@@ -191,22 +191,60 @@ the **master first**, so its access key is already in the allow-list nodes pull.
 
 ## Daily use
 
-From the MASTER (or any node):
+### Reaching the child machines (from the orchestrator/MASTER)
+
+Setup writes an `ssh <name>` shortcut into `~/.ssh/config` for every machine in
+`cluster.conf`, each pointing at the node's tailnet name and using the cluster
+access key. The **current cluster** (see `cluster.conf`) is:
+
+| # | Name | Tailnet host | Reach it with |
+|---|------|--------------|---------------|
+| 1 | Elga | `elga-1` | `ssh elga` |
+| 2 | Nora | `nora-2` | `ssh nora` |
 
 ```bash
-ssh nora            # shortcuts are written into ~/.ssh/config for every machine
-ssh liger
+ssh elga                     # open a shell on Elga (mini #1)
+ssh nora                     # open a shell on Nora (mini #2)
+ssh amy@elga-1               # the long form the shortcut expands to
+
+ssh elga 'hostname; uptime'  # run a one-off command without an interactive shell
+ssh nora "cd ~/dev/agent-team && git pull"   # e.g. refresh a node's checkout
 ```
 
-Resilient + persistent Claude Code (add to `~/.zshrc` on the MASTER):
+> **Prerequisite — the tailnet must be up.** The shortcuts dial each node by its
+> Tailscale MagicDNS name (`elga-1`, `nora-2`), so this box has to be signed in to
+> the same tailnet. Check with `tailscale status`; if it says the service isn't
+> running, start it (menu-bar app, or `sudo tailscale up`) and approve this device
+> in the admin console. On LAN-only setups (`--no-tailscale`), reach nodes by their
+> `.local` name or IP instead.
+
+### Persistent, resilient Claude Code sessions
+
+Run Claude Code inside **tmux** on the node so it survives disconnects, and dial in
+over **autossh** so the link auto-reconnects. Add aliases to `~/.zshrc` on the
+MASTER — one per node:
 
 ```bash
+alias elga='autossh -M 0 -t elga "tmux new -A -s claude"'
 alias nora='autossh -M 0 -t nora "tmux new -A -s claude"'
 ```
 
-`autossh` keeps the link alive; `tmux new -A -s claude` always reattaches the same
-session. Detach with `Ctrl-b d` (Claude keeps running on the node). Details and
-troubleshooting: `../SSH_SETUP.md`.
+`autossh` keeps the link alive; `tmux new -A -s claude` attaches the `claude`
+session if it exists or creates it otherwise, so you always land in the same place.
+Detach with `Ctrl-b d` — Claude keeps running on the node — and re-run the alias to
+reattach. Details and troubleshooting: `../SSH_SETUP.md`.
+
+### Fan out to every node
+
+```bash
+# Same command on all registered nodes (skips the master's own line):
+for n in $(awk -F'|' '{print tolower($2)}' cluster.conf); do
+  echo "== $n =="; ssh "$n" 'uptime'
+done
+```
+
+Look up any machine's shared config (e.g. who its Linear tasks route to) with
+`./get_agent_config.sh --name elga` — see **Shared agent state** above.
 
 ---
 
